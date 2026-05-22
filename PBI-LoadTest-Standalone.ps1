@@ -38,14 +38,26 @@
   Default: 1, 10, 25, 50, 100.
 
 .EXAMPLE
-  # After pasting in pwsh:
-  .\Standalone-LoadTest.ps1
-  # Or with overrides:
-  .\Standalone-LoadTest.ps1 -ThinkTimeMode realistic -ConcurrencyLevels 1,10,25
+  # Pipeline validation, ~30s (auth + discovery, 1 user, BCS only):
+  .\Standalone-LoadTest.ps1 -Mode smoke
+
+  # Pre-flight check before full run, ~3-5min (5 users, BCS+WCS):
+  .\Standalone-LoadTest.ps1 -Mode test
+
+  # Full baseline run, ~25-40min (1,10,25,50,100 users, BCS+WCS):
+  .\Standalone-LoadTest.ps1 -Mode baseline
+
+  # Custom — uses explicit params instead of presets:
+  .\Standalone-LoadTest.ps1 -Mode custom -ConcurrencyLevels 1,10,25 -ThinkTimeMode realistic
 #>
 
 [CmdletBinding()]
 param(
+    # ─── Mode preset — most users only set this. Overrides Concurrency*/Iterations* below. ──
+    [ValidateSet('smoke','test','baseline','custom')]
+    [string]$Mode = 'baseline',
+
+    # ─── Custom overrides — only effective when -Mode custom (else ignored with a warning). ──
     [ValidateSet('stress','realistic')]
     [string]$ThinkTimeMode = 'stress',
     [int[]]$ConcurrencyLevels = @(1,10,25,50,100),
@@ -59,12 +71,65 @@ $ErrorActionPreference = 'Stop'
 $global:ProgressPreference = 'SilentlyContinue'   # speeds up Invoke-WebRequest
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0. Banner
+# 0. Apply mode preset (overrides params unless Mode=custom)
+# ─────────────────────────────────────────────────────────────────────────────
+$skipWcsByMode = $false   # smoke can force-skip WCS
+
+switch ($Mode) {
+    'smoke' {
+        # Pipeline validation only. Should finish in ~30s on any model.
+        # Goal: confirm auth + discovery + REST pipeline, NOT to measure perf.
+        $ConcurrencyLevels = @(1)
+        $IterationsPerUser = 1
+        $ThinkTimeMode     = 'stress'   # ignored anyway — think_time forced 0 below
+        $BatterySize       = 2
+        $skipWcsByMode     = $true
+        $estDuration       = "~30 seconds"
+    }
+    'test' {
+        # Pre-flight functional check. Light load on 5 concurrent users to see
+        # if pipeline holds, WCS works, and report is generated. Use this BEFORE
+        # the full baseline run to catch problems cheaply.
+        $ConcurrencyLevels = @(5)
+        $IterationsPerUser = 2
+        $ThinkTimeMode     = 'stress'   # 3-8s BCS, 0s WCS
+        $BatterySize       = 5
+        $estDuration       = "~3-5 minutes"
+    }
+    'baseline' {
+        # Full perf baseline. The numbers you actually report to stakeholders.
+        $ConcurrencyLevels = @(1,10,25,50,100)
+        $IterationsPerUser = 2
+        $ThinkTimeMode     = 'stress'   # for sign-off, switch to 'realistic' (manual)
+        $BatterySize       = 5
+        $estDuration       = "~25-40 minutes"
+    }
+    'custom' {
+        # Honor whatever the user passed. No override.
+        $estDuration       = "depends on params"
+    }
+}
+
+# Warn if user passed custom-looking params but didn't set -Mode custom
+if ($Mode -ne 'custom') {
+    $cliBound = $PSBoundParameters.Keys
+    $explicit = $cliBound | Where-Object { $_ -in @('ThinkTimeMode','ConcurrencyLevels','IterationsPerUser','BatterySize') }
+    if ($explicit) {
+        Write-Host ""
+        Write-Host "  WARNING: -Mode $Mode ignores these explicit params: $($explicit -join ', ')" -ForegroundColor Yellow
+        Write-Host "           If you want your values to apply, use: -Mode custom" -ForegroundColor Yellow
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0b. Banner
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor White
 Write-Host " Power BI Standalone Load Test" -ForegroundColor White
-Write-Host " Concurrency: $($ConcurrencyLevels -join ', ') | Think-time: $ThinkTimeMode" -ForegroundColor White
+Write-Host " Mode: $Mode (est. $estDuration)" -ForegroundColor White
+Write-Host " Concurrency: $($ConcurrencyLevels -join ', ')" -ForegroundColor White
+Write-Host " Iterations/user: $IterationsPerUser | Think-time: $ThinkTimeMode | Battery size: $BatterySize" -ForegroundColor White
 Write-Host "============================================================" -ForegroundColor White
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,55 +453,179 @@ if (-not $filterColumn -or $filterValues.Count -lt 5) {
     $scenarios = @('BCS','WCS')
 }
 
+# Mode=smoke forces BCS-only — smoke is for pipeline validation, not for
+# capturing the WCS signal. Keeps the run under ~30s regardless of model size.
+if ($skipWcsByMode -and $scenarios -contains 'WCS') {
+    Write-Host "      Mode=smoke → forcing BCS-only (WCS skipped)." -ForegroundColor DarkCyan
+    $scenarios = @('BCS')
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Build battery
+# 7. Build battery + smoke test with intelligent retries
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Detect literal style: try quoted (string), then bare (numeric), then DATE() (date).
+# We probe the SAMPLE value, not just guess, so we lock in the right style per column.
+function Get-LiteralCandidates($value) {
+    $cands = New-Object System.Collections.Generic.List[string]
+    $s = [string]$value
+    # 1. Quoted string (default)
+    $cands.Add('"' + ($s -replace '"','""') + '"') | Out-Null
+    # 2. Bare numeric (if parses as number)
+    $num = 0.0
+    if ([double]::TryParse($s, [ref]$num)) {
+        $cands.Add($s) | Out-Null
+    }
+    # 3. Date literal — DATE(yyyy, M, d)
+    $dt = Get-Date
+    if ([datetime]::TryParse($s, [ref]$dt)) {
+        $cands.Add("DATE($($dt.Year), $($dt.Month), $($dt.Day))") | Out-Null
+    }
+    return $cands.ToArray()
+}
+
 $battery = New-Object System.Collections.Generic.List[object]
 $qid = 0
 foreach ($m in $pickedMeasures) {
     $qid++
-    # Unfiltered query — BCS-only signal, will benefit hugely from cache
+    # Unfiltered (BCS-only signal — will benefit from query cache)
     $battery.Add([PSCustomObject]@{
-        id        = "Q$($qid)_unfilt"
-        wcsCapable= $false
-        dax       = "EVALUATE ROW(""v"", CALCULATE([$($m.name)]))"
-    })
+        id           = "Q$($qid)_unfilt_$($m.name -replace '[^a-zA-Z0-9]','_')"
+        measureName  = $m.name
+        measureTable = $m.table
+        wcsCapable   = $false
+        dax          = "EVALUATE ROW(""v"", CALCULATE([$($m.name)]))"
+        litStyle     = $null
+    }) | Out-Null
     if ($filterColumn) {
         $qid++
-        # Filtered query — placeholder {{F}} swapped per call
+        # Filtered with {{F}} placeholder — literal style TBD by smoke test
         $dax = "EVALUATE ROW(""v"", CALCULATE([$($m.name)], '$($filterColumn.table)'[$($filterColumn.column)] = {{F}}))"
         $battery.Add([PSCustomObject]@{
-            id           = "Q$($qid)_filt"
+            id           = "Q$($qid)_filt_$($m.name -replace '[^a-zA-Z0-9]','_')"
+            measureName  = $m.name
+            measureTable = $m.table
             wcsCapable   = $true
             dax          = $dax
             filterTable  = $filterColumn.table
             filterColumn = $filterColumn.column
-        })
+            litStyle     = $null   # filled in by smoke test below
+        }) | Out-Null
     }
 }
 
-# Smoke test: run each query once to validate
+# Smoke test: try each query, and for filtered queries try multiple literal styles
+# until one works. Persist the working style so the load-test runner uses it.
 Write-Host ""
-Write-Host "[5/7] Smoke-testing the battery (1 call per query)..." -ForegroundColor Cyan
+Write-Host "[5/7] Smoke-testing the battery (with auto-retry on filter literal)..." -ForegroundColor Cyan
+
+$smokeLog = New-Object System.Collections.Generic.List[object]
 $batteryFinal = New-Object System.Collections.Generic.List[object]
+
 foreach ($q in $battery) {
-    $daxTry = $q.dax
-    if ($q.wcsCapable) {
-        $sample = $filterValues[0]
-        $lit = "`"$($sample -replace '"','""')`""
-        $daxTry = $daxTry -replace '\{\{F\}\}', $lit
+    if (-not $q.wcsCapable) {
+        # Unfiltered — single attempt
+        $r = Invoke-Dax -Dax $q.dax -Tk $token -Timeout 30
+        if ($r.ok) {
+            Write-Host "      OK   $($q.id) → $($r.ms) ms" -ForegroundColor DarkGreen
+            $batteryFinal.Add($q) | Out-Null
+            $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='OK'; ms=$r.ms; status=$r.status; err=$null; litStyle=$null }) | Out-Null
+        } else {
+            $shortErr = if ($r.err) { $r.err.Substring(0, [Math]::Min(200, $r.err.Length)) } else { "no detail" }
+            Write-Host "      SKIP $($q.id) → HTTP $($r.status): $shortErr" -ForegroundColor Yellow
+            $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='SKIP'; ms=$r.ms; status=$r.status; err=$shortErr; litStyle=$null }) | Out-Null
+        }
+        continue
     }
-    $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout 30
-    if ($r.ok) {
-        Write-Host "      OK  $($q.id) → $($r.ms) ms" -ForegroundColor DarkGreen
-        $batteryFinal.Add($q)
+
+    # Filtered — try sample values with literal-style fallback
+    $sample = $filterValues[0]
+    $candidates = Get-LiteralCandidates $sample
+    $passed = $false
+    $lastErr = $null
+    $lastStatus = $null
+    $lastMs = $null
+    $winningStyle = $null
+
+    for ($ci = 0; $ci -lt $candidates.Count; $ci++) {
+        $lit = $candidates[$ci]
+        $daxTry = $q.dax -replace '\{\{F\}\}', [Regex]::Escape($lit) -replace '\\',''   # de-escape after sub
+        # Simpler & safer replacement (avoid regex-escape gotchas):
+        $daxTry = $q.dax.Replace('{{F}}', $lit)
+        $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout 30
+        if ($r.ok) {
+            $passed = $true
+            $winningStyle = if ($ci -eq 0) { 'string' } elseif ($ci -eq 1) { 'numeric' } else { 'date' }
+            $lastMs = $r.ms
+            $lastStatus = $r.status
+            break
+        }
+        $lastErr = if ($r.err) { $r.err.Substring(0, [Math]::Min(200, $r.err.Length)) } else { "no detail" }
+        $lastStatus = $r.status
+        $lastMs = $r.ms
+    }
+
+    if ($passed) {
+        $q.litStyle = $winningStyle
+        Write-Host "      OK   $($q.id) → $lastMs ms (literal style: $winningStyle, sample=$sample)" -ForegroundColor DarkGreen
+        $batteryFinal.Add($q) | Out-Null
+        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='OK'; ms=$lastMs; status=$lastStatus; err=$null; litStyle=$winningStyle; sample=$sample }) | Out-Null
     } else {
-        Write-Host "      SKIP $($q.id) → HTTP $($r.status): $($r.err)" -ForegroundColor Yellow
+        Write-Host "      SKIP $($q.id) → HTTP $lastStatus after $($candidates.Count) literal styles tried." -ForegroundColor Yellow
+        Write-Host "           last error: $lastErr" -ForegroundColor DarkYellow
+        Write-Host "           sample used: '$sample'" -ForegroundColor DarkYellow
+        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='SKIP'; ms=$lastMs; status=$lastStatus; err=$lastErr; litStyle=$null; sample=$sample }) | Out-Null
     }
 }
-if ($batteryFinal.Count -eq 0) { throw "All battery queries failed smoke. Aborting." }
+
+# Fail-fast if everything died
+if ($batteryFinal.Count -eq 0) {
+    Write-Host ""
+    Write-Host "ALL BATTERY QUERIES FAILED SMOKE. Aborting." -ForegroundColor Red
+    Write-Host "Diagnostic dump:" -ForegroundColor Red
+    $smokeLog | Format-Table -AutoSize | Out-String | Write-Host
+    throw "All battery queries failed smoke."
+}
 $battery = $batteryFinal.ToArray()
-Write-Host "      Final battery: $($battery.Count) queries." -ForegroundColor DarkGreen
+
+# ─── EXPLICIT BATTERY COMPOSITION SUMMARY ───────────────────────────────────
+$unfiltCount = ($battery | Where-Object { -not $_.wcsCapable }).Count
+$filtCount   = ($battery | Where-Object { $_.wcsCapable }).Count
+
+Write-Host ""
+Write-Host "      ┌─ Final battery composition ─────────────────────────────┐" -ForegroundColor Cyan
+Write-Host "      │  Unfiltered queries (run in BCS only):     $unfiltCount" -ForegroundColor Cyan
+Write-Host "      │  Filtered queries   (run in BCS and WCS):  $filtCount" -ForegroundColor Cyan
+$totalPerIter = $unfiltCount + $filtCount
+$bcsCalls = $totalPerIter
+$wcsCalls = $filtCount
+Write-Host "      │  → per iteration: BCS=$bcsCalls calls, WCS=$wcsCalls calls" -ForegroundColor Cyan
+Write-Host "      └─────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+
+# If WCS scenario was requested but no filtered query survived smoke → drop WCS.
+if ($scenarios -contains 'WCS' -and $filtCount -eq 0) {
+    Write-Host ""
+    Write-Host "      WARNING: WCS scenario requested but no filtered queries passed smoke." -ForegroundColor Yellow
+    Write-Host "      → Dropping WCS. Only BCS will run." -ForegroundColor Yellow
+    Write-Host "      Likely cause: filter column literal type mismatch — see smoke log above." -ForegroundColor DarkYellow
+    $scenarios = @('BCS')
+}
+
+# Persist diagnostic dump for offline analysis
+$diagPath = Join-Path $OutputDir "discovery.json"
+@{
+    timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
+    target = @{ tenant=$tenantId; workspace=$workspaceId; dataset=$datasetId }
+    discoveryMode = $discoveryMode
+    pickedMeasures = $pickedMeasures
+    filterColumn = $filterColumn
+    filterValuesCount = $filterValues.Count
+    filterValuesSample = ($filterValues | Select-Object -First 10)
+    smokeLog = $smokeLog
+    finalBattery = $battery | Select-Object id, measureName, measureTable, wcsCapable, litStyle
+    scenariosToRun = $scenarios
+} | ConvertTo-Json -Depth 6 | Out-File $diagPath -Encoding utf8
+Write-Host "      Diagnostic dump saved: $diagPath" -ForegroundColor DarkGray
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Load test
@@ -447,6 +636,12 @@ Write-Host "[6/7] Load test ($($ConcurrencyLevels -join ', ') × $($scenarios -j
 # think-time
 $thinkBcs = if ($ThinkTimeMode -eq 'realistic') { @(25,40) } else { @(3,8) }
 $thinkWcs = @(0,0)
+
+# Mode=smoke forces zero think-time so the validation run finishes fast.
+if ($Mode -eq 'smoke') {
+    $thinkBcs = @(0,0)
+    $thinkWcs = @(0,0)
+}
 
 $totalStart = Get-Date
 $csvLock = New-Object System.Threading.Mutex($false, "PbiCsvLock_$([guid]::NewGuid().ToString('N'))")
@@ -507,9 +702,23 @@ foreach ($level in $ConcurrencyLevels) {
                         } else {
                             $sample = $filterVals[0]  # BCS: stable so caches hit
                         }
-                        $lit = '"' + ($sample -replace '"','""') + '"'
-                        $daxToRun = $daxToRun -replace '\{\{F\}\}', $lit
-                        $filterUsed = $sample
+                        # Use the literal style that the smoke test confirmed works
+                        # for this column. Falls back to 'string' if unset.
+                        $style = if ($q.litStyle) { $q.litStyle } else { 'string' }
+                        $lit = switch ($style) {
+                            'numeric' { [string]$sample }
+                            'date' {
+                                $dt = Get-Date
+                                if ([datetime]::TryParse([string]$sample, [ref]$dt)) {
+                                    "DATE($($dt.Year), $($dt.Month), $($dt.Day))"
+                                } else {
+                                    '"' + ([string]$sample -replace '"','""') + '"'
+                                }
+                            }
+                            default { '"' + ([string]$sample -replace '"','""') + '"' }
+                        }
+                        $daxToRun = $q.dax.Replace('{{F}}', $lit)
+                        $filterUsed = [string]$sample
                     }
 
                     # Think time (BCS only)
