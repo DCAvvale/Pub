@@ -1,0 +1,4 @@
+relationship r_{TabellaDa}_{TabellaA}
+	fromColumn: {TabellaDa}.{ColonnaDa}
+	toColumn: {TabellaA}.{ColonnaA}
+
