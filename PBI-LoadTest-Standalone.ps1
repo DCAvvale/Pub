@@ -538,43 +538,90 @@ foreach ($q in $battery) {
         continue
     }
 
-    # Filtered — try sample values with literal-style fallback
+    # Filtered — try multiple DAX shapes × multiple literal styles. Each
+    # combination addresses a different failure mode we've seen in the wild:
+    #   - 'inline'    : CALCULATE([m], 't'[c] = lit)             ← default, most models
+    #   - 'filter-fn' : CALCULATE([m], FILTER('t', 't'[c] = lit)) ← when CALCULATE
+    #                                                              rejects direct equality
+    #                                                              (e.g. table is on
+    #                                                              the "many" side of a
+    #                                                              broken relationship)
+    #   - 'treatas'   : CALCULATE([m], TREATAS({lit}, 't'[c]))    ← when no relationship
+    #                                                              exists between filter
+    #                                                              table and fact (common
+    #                                                              with disconnected dims)
     $sample = $filterValues[0]
     $candidates = Get-LiteralCandidates $sample
     $passed = $false
     $lastErr = $null
     $lastStatus = $null
     $lastMs = $null
+    $lastDax = $null
     $winningStyle = $null
+    $winningShape = $null
+    $allAttempts = New-Object System.Collections.Generic.List[object]
 
-    for ($ci = 0; $ci -lt $candidates.Count; $ci++) {
-        $lit = $candidates[$ci]
-        $daxTry = $q.dax -replace '\{\{F\}\}', [Regex]::Escape($lit) -replace '\\',''   # de-escape after sub
-        # Simpler & safer replacement (avoid regex-escape gotchas):
-        $daxTry = $q.dax.Replace('{{F}}', $lit)
-        $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout 30
-        if ($r.ok) {
-            $passed = $true
-            $winningStyle = if ($ci -eq 0) { 'string' } elseif ($ci -eq 1) { 'numeric' } else { 'date' }
-            $lastMs = $r.ms
+    $tableQ = $q.filterTable
+    $colQ   = $q.filterColumn
+
+    foreach ($shape in @('inline', 'filter-fn', 'treatas')) {
+        if ($passed) { break }
+        for ($ci = 0; $ci -lt $candidates.Count; $ci++) {
+            $lit = $candidates[$ci]
+            $styleName = if ($ci -eq 0) { 'string' } elseif ($ci -eq 1) { 'numeric' } else { 'date' }
+
+            # Build the actual DAX based on shape (independent of the {{F}} template)
+            $daxTry = switch ($shape) {
+                'inline'    { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], '$tableQ'[$colQ] = $lit))" }
+                'filter-fn' { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], FILTER('$tableQ', '$tableQ'[$colQ] = $lit)))" }
+                'treatas'   { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], TREATAS({$lit}, '$tableQ'[$colQ])))" }
+            }
+
+            $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout 30
+            $errSnip = if ($r.err) { $r.err.Substring(0, [Math]::Min(400, $r.err.Length)) } else { $null }
+            $allAttempts.Add([PSCustomObject]@{
+                shape    = $shape
+                literal  = $styleName
+                status   = $r.status
+                ms       = $r.ms
+                dax      = $daxTry
+                error    = $errSnip
+            }) | Out-Null
+
+            if ($r.ok) {
+                $passed = $true
+                $winningStyle = $styleName
+                $winningShape = $shape
+                $lastMs = $r.ms
+                $lastStatus = $r.status
+                # store the working template back on $q so the load-test runner reuses it
+                $q.dax = switch ($shape) {
+                    'inline'    { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], '$tableQ'[$colQ] = {{F}}))" }
+                    'filter-fn' { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], FILTER('$tableQ', '$tableQ'[$colQ] = {{F}})))" }
+                    'treatas'   { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], TREATAS({{{F}}}, '$tableQ'[$colQ])))" }
+                }
+                break
+            }
+            $lastErr = $errSnip
             $lastStatus = $r.status
-            break
+            $lastMs = $r.ms
+            $lastDax = $daxTry
         }
-        $lastErr = if ($r.err) { $r.err.Substring(0, [Math]::Min(200, $r.err.Length)) } else { "no detail" }
-        $lastStatus = $r.status
-        $lastMs = $r.ms
     }
 
     if ($passed) {
         $q.litStyle = $winningStyle
-        Write-Host "      OK   $($q.id) → $lastMs ms (literal style: $winningStyle, sample=$sample)" -ForegroundColor DarkGreen
+        Write-Host "      OK   $($q.id) → $lastMs ms (shape: $winningShape, literal: $winningStyle, sample=$sample)" -ForegroundColor DarkGreen
         $batteryFinal.Add($q) | Out-Null
-        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='OK'; ms=$lastMs; status=$lastStatus; err=$null; litStyle=$winningStyle; sample=$sample }) | Out-Null
+        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='OK'; ms=$lastMs; status=$lastStatus; err=$null; litStyle=$winningStyle; shape=$winningShape; sample=$sample; attempts=$allAttempts.ToArray() }) | Out-Null
     } else {
-        Write-Host "      SKIP $($q.id) → HTTP $lastStatus after $($candidates.Count) literal styles tried." -ForegroundColor Yellow
-        Write-Host "           last error: $lastErr" -ForegroundColor DarkYellow
-        Write-Host "           sample used: '$sample'" -ForegroundColor DarkYellow
-        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='SKIP'; ms=$lastMs; status=$lastStatus; err=$lastErr; litStyle=$null; sample=$sample }) | Out-Null
+        Write-Host "      SKIP $($q.id) → HTTP $lastStatus after $($allAttempts.Count) DAX shapes × literal styles tried." -ForegroundColor Yellow
+        Write-Host "           last DAX tried:" -ForegroundColor DarkYellow
+        Write-Host "             $lastDax" -ForegroundColor DarkGray
+        Write-Host "           last error (400 char max):" -ForegroundColor DarkYellow
+        Write-Host "             $lastErr" -ForegroundColor DarkGray
+        Write-Host "           sample used: '$sample' (filter column: [$tableQ].[$colQ])" -ForegroundColor DarkYellow
+        $smokeLog.Add([PSCustomObject]@{ id=$q.id; result='SKIP'; ms=$lastMs; status=$lastStatus; err=$lastErr; litStyle=$null; shape=$null; sample=$sample; attempts=$allAttempts.ToArray() }) | Out-Null
     }
 }
 
