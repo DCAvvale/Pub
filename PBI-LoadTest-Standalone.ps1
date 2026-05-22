@@ -71,7 +71,34 @@ $ErrorActionPreference = 'Stop'
 $global:ProgressPreference = 'SilentlyContinue'   # speeds up Invoke-WebRequest
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0. Apply mode preset (overrides params unless Mode=custom)
+# 0a. Interactive Mode prompt if not passed on CLI
+# (saves the user from remembering -Mode flag when launching with no args)
+# ─────────────────────────────────────────────────────────────────────────────
+if (-not $PSBoundParameters.ContainsKey('Mode')) {
+    Write-Host ""
+    Write-Host "Select run mode:" -ForegroundColor White
+    Write-Host "  [1] smoke    — pipeline check, 1 user, ~30 sec" -ForegroundColor DarkGray
+    Write-Host "  [2] test     — functional check, 5 users, ~3-5 min" -ForegroundColor DarkGray
+    Write-Host "  [3] baseline — full baseline, 1/10/25/50/100 users, ~25-40 min" -ForegroundColor DarkGray
+    Write-Host "  [4] custom   — use explicit params" -ForegroundColor DarkGray
+    while ($true) {
+        $sel = Read-Host "  Choice (1/2/3/4) [default 2]"
+        $sel = $sel.Trim()
+        if (-not $sel) { $sel = '2' }
+        switch ($sel) {
+            '1' { $Mode = 'smoke'; break }
+            '2' { $Mode = 'test'; break }
+            '3' { $Mode = 'baseline'; break }
+            '4' { $Mode = 'custom'; break }
+        }
+        if ($Mode) { break }
+        Write-Host "  Invalid choice. Type 1, 2, 3, or 4." -ForegroundColor Red
+    }
+    Write-Host "  → Mode: $Mode" -ForegroundColor DarkGreen
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0b. Apply mode preset (overrides params unless Mode=custom)
 # ─────────────────────────────────────────────────────────────────────────────
 $skipWcsByMode = $false   # smoke can force-skip WCS
 
