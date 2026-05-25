@@ -74,7 +74,7 @@ param(
     [string]$ThinkTimeMode = 'stress',
     [int[]]$ConcurrencyLevels = @(1,10,25,50,100),
     [int]$IterationsPerUser = 2,
-    [int]$TimeoutSec = 120,
+    [int]$TimeoutSec = 180,        # per-call HTTP timeout (sec). 180 covers heavy Performance Analyzer queries.
     [int]$BatterySize = 5,         # number of base measures (× 2 → 1 unfiltered + 1 filtered each)
     [string]$OutputDir = ".\pbi-loadtest-output"
 )
@@ -624,7 +624,7 @@ $batteryFinal = New-Object System.Collections.Generic.List[object]
 foreach ($q in $battery) {
     if (-not $q.wcsCapable) {
         # Unfiltered — single attempt
-        $r = Invoke-Dax -Dax $q.dax -Tk $token -Timeout 30
+        $r = Invoke-Dax -Dax $q.dax -Tk $token -Timeout $TimeoutSec
         if ($r.ok) {
             Write-Host "      OK   $($q.id) → $($r.ms) ms" -ForegroundColor DarkGreen
             $batteryFinal.Add($q) | Out-Null
@@ -676,7 +676,7 @@ foreach ($q in $battery) {
                 'treatas'   { "EVALUATE ROW(""v"", CALCULATE([$($q.measureName)], TREATAS({$lit}, '$tableQ'[$colQ])))" }
             }
 
-            $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout 30
+            $r = Invoke-Dax -Dax $daxTry -Tk $token -Timeout $TimeoutSec
             $errSnip = if ($r.err) { $r.err.Substring(0, [Math]::Min(400, $r.err.Length)) } else { $null }
             $allAttempts.Add([PSCustomObject]@{
                 shape    = $shape
