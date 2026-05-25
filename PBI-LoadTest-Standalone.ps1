@@ -49,6 +49,9 @@
 
   # Custom — uses explicit params instead of presets:
   .\Standalone-LoadTest.ps1 -Mode custom -ConcurrencyLevels 1,10,25 -ThinkTimeMode realistic
+
+  # Bring-your-own queries (from Performance Analyzer) — skips discovery entirely:
+  .\Standalone-LoadTest.ps1 -Mode test -QueriesPath .\queries
 #>
 
 [CmdletBinding()]
@@ -56,6 +59,15 @@ param(
     # ─── Mode preset — most users only set this. Overrides Concurrency*/Iterations* below. ──
     [ValidateSet('smoke','test','baseline','custom')]
     [string]$Mode = 'baseline',
+
+    # ─── BYOQ: folder containing .dax files (one query per file). When set, the
+    # script SKIPS discovery + filter pool entirely and uses these as the battery.
+    # Recommended source: Power BI Desktop → View → Performance Analyzer →
+    # Start recording → interact with the report → Stop → "Copy query" on each
+    # visual → paste each one into its own .dax file under this folder.
+    # Only BCS scenario runs (no WCS) because PA queries are fully concrete —
+    # there's no filter slot to randomize without manual placeholder editing.
+    [string]$QueriesPath = $null,
 
     # ─── Custom overrides — only effective when -Mode custom (else ignored with a warning). ──
     [ValidateSet('stress','realistic')]
@@ -157,6 +169,9 @@ Write-Host " Power BI Standalone Load Test" -ForegroundColor White
 Write-Host " Mode: $Mode (est. $estDuration)" -ForegroundColor White
 Write-Host " Concurrency: $($ConcurrencyLevels -join ', ')" -ForegroundColor White
 Write-Host " Iterations/user: $IterationsPerUser | Think-time: $ThinkTimeMode | Battery size: $BatterySize" -ForegroundColor White
+if ($QueriesPath) {
+    Write-Host " Queries: BYO (custom .dax files from $QueriesPath)" -ForegroundColor Magenta
+}
 Write-Host "============================================================" -ForegroundColor White
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,18 +293,65 @@ function Invoke-Dax {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Discovery: measures + filter column
-# Three-tier strategy: INFO.* DAX functions → REST tables API → manual input.
-# INFO.* requires compat-level >= 1500 (PBI Dec-2023+). Older models (SSAS
-# live-connect, legacy migrations) need fallbacks.
+# 6. Discovery (or BYOQ — bring your own queries)
+# If -QueriesPath is set, skip model discovery entirely: each .dax file in the
+# folder becomes one battery entry. This is the recommended approach when you
+# have Performance Analyzer captures — those queries already reflect the real
+# report traffic, no synthesis needed.
+# Otherwise: three-tier discovery (INFO.* DAX → REST tables API → manual input).
 # ─────────────────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "[4/7] Discovering model (measures + filter column)..." -ForegroundColor Cyan
 
 $pickedMeasures = $null
 $filterColumn   = $null
 $filterValues   = @()
 $discoveryMode  = 'unknown'
+$useByoQueries  = $false
+$byoBattery     = $null   # populated below if QueriesPath is set
+
+if ($QueriesPath) {
+    Write-Host ""
+    Write-Host "[4/7] Loading custom queries from: $QueriesPath" -ForegroundColor Cyan
+    if (-not (Test-Path $QueriesPath)) {
+        throw "QueriesPath '$QueriesPath' does not exist."
+    }
+    $daxFiles = Get-ChildItem -Path $QueriesPath -Filter "*.dax" -File | Sort-Object Name
+    if (-not $daxFiles -or $daxFiles.Count -eq 0) {
+        throw "No .dax files found in '$QueriesPath'. Drop one .dax file per query."
+    }
+    Write-Host "      Found $($daxFiles.Count) .dax file(s):" -ForegroundColor DarkGreen
+
+    $byoBattery = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $daxFiles) {
+        $content = Get-Content -LiteralPath $f.FullName -Raw
+        if (-not $content -or $content.Trim().Length -eq 0) {
+            Write-Host "      [skip] $($f.Name) — empty file" -ForegroundColor Yellow
+            continue
+        }
+        # Strip leading "// DAX Query" comment Performance Analyzer prepends.
+        # Keep DEFINE / EVALUATE / VAR / MEASURE — those are part of the query.
+        $cleanDax = $content -replace '^\s*//[^\r\n]*[\r\n]+',''
+        $byoBattery.Add([PSCustomObject]@{
+            id           = "Q$($byoBattery.Count + 1)_$([IO.Path]::GetFileNameWithoutExtension($f.Name))"
+            measureName  = $f.BaseName
+            measureTable = '(custom)'
+            wcsCapable   = $false   # BYOQ has no placeholder → no WCS scenario
+            dax          = $cleanDax
+            litStyle     = $null
+            sourceFile   = $f.Name
+        }) | Out-Null
+        $preview = $cleanDax.Substring(0, [Math]::Min(80, $cleanDax.Length)) -replace '[\r\n]+', ' '
+        Write-Host "        - $($f.Name)  →  $preview..." -ForegroundColor DarkGray
+    }
+    if ($byoBattery.Count -eq 0) {
+        throw "All .dax files were empty. Aborting."
+    }
+    $useByoQueries = $true
+    $discoveryMode = 'byo-queries'
+    $scenarios = @('BCS')   # BYOQ ⇒ BCS only (PA queries have concrete filters)
+    Write-Host "      Mode: BYO queries — discovery & filter pool SKIPPED. Scenarios: BCS only." -ForegroundColor DarkCyan
+} else {
+    Write-Host ""
+    Write-Host "[4/7] Discovering model (measures + filter column)..." -ForegroundColor Cyan
 
 # ── Tier 1: INFO.MEASURES / INFO.TABLES / INFO.COLUMNS ──────────────────────
 Write-Host "      Tier 1: trying INFO.* DAX functions..." -ForegroundColor DarkGray
@@ -480,6 +542,8 @@ if (-not $filterColumn -or $filterValues.Count -lt 5) {
     $scenarios = @('BCS','WCS')
 }
 
+}  # end of else-branch for $QueriesPath (full discovery path)
+
 # Mode=smoke forces BCS-only — smoke is for pipeline validation, not for
 # capturing the WCS signal. Keeps the run under ~30s regardless of model size.
 if ($skipWcsByMode -and $scenarios -contains 'WCS') {
@@ -512,32 +576,40 @@ function Get-LiteralCandidates($value) {
 }
 
 $battery = New-Object System.Collections.Generic.List[object]
-$qid = 0
-foreach ($m in $pickedMeasures) {
-    $qid++
-    # Unfiltered (BCS-only signal — will benefit from query cache)
-    $battery.Add([PSCustomObject]@{
-        id           = "Q$($qid)_unfilt_$($m.name -replace '[^a-zA-Z0-9]','_')"
-        measureName  = $m.name
-        measureTable = $m.table
-        wcsCapable   = $false
-        dax          = "EVALUATE ROW(""v"", CALCULATE([$($m.name)]))"
-        litStyle     = $null
-    }) | Out-Null
-    if ($filterColumn) {
+
+if ($useByoQueries) {
+    # BYOQ path: queries already constructed from .dax files. No synthesis,
+    # no placeholders, no WCS shaping.
+    foreach ($q in $byoBattery) { $battery.Add($q) | Out-Null }
+} else {
+    # Discovery-driven synthesis: build unfilt + filt pairs for each measure.
+    $qid = 0
+    foreach ($m in $pickedMeasures) {
         $qid++
-        # Filtered with {{F}} placeholder — literal style TBD by smoke test
-        $dax = "EVALUATE ROW(""v"", CALCULATE([$($m.name)], '$($filterColumn.table)'[$($filterColumn.column)] = {{F}}))"
+        # Unfiltered (BCS-only signal — will benefit from query cache)
         $battery.Add([PSCustomObject]@{
-            id           = "Q$($qid)_filt_$($m.name -replace '[^a-zA-Z0-9]','_')"
+            id           = "Q$($qid)_unfilt_$($m.name -replace '[^a-zA-Z0-9]','_')"
             measureName  = $m.name
             measureTable = $m.table
-            wcsCapable   = $true
-            dax          = $dax
-            filterTable  = $filterColumn.table
-            filterColumn = $filterColumn.column
-            litStyle     = $null   # filled in by smoke test below
+            wcsCapable   = $false
+            dax          = "EVALUATE ROW(""v"", CALCULATE([$($m.name)]))"
+            litStyle     = $null
         }) | Out-Null
+        if ($filterColumn) {
+            $qid++
+            # Filtered with {{F}} placeholder — literal style TBD by smoke test
+            $dax = "EVALUATE ROW(""v"", CALCULATE([$($m.name)], '$($filterColumn.table)'[$($filterColumn.column)] = {{F}}))"
+            $battery.Add([PSCustomObject]@{
+                id           = "Q$($qid)_filt_$($m.name -replace '[^a-zA-Z0-9]','_')"
+                measureName  = $m.name
+                measureTable = $m.table
+                wcsCapable   = $true
+                dax          = $dax
+                filterTable  = $filterColumn.table
+                filterColumn = $filterColumn.column
+                litStyle     = $null   # filled in by smoke test below
+            }) | Out-Null
+        }
     }
 }
 
